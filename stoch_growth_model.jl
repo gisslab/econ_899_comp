@@ -1,4 +1,6 @@
 using Parameters
+using Distributed
+using SharedArrays
 
 @with_kw struct Primitives
     β::Float64 = 0.99 #discount rate
@@ -25,10 +27,10 @@ end
 
 
 #function for initializing model primitives and results
-function Initialize()
+@everywhere function Initialize()
     prim = Primitives() #initialize primtiives
-    val_func = zeros(prim.nk) #initial value function guess
-    pol_func = zeros(prim.nk) #initial policy function guess
+    val_func = zeros(prim.nk, prim.nz) #initial value function guess
+    pol_func = zeros(prim.nk,prim.nz) #initial policy function guess
     res = Results(val_func, pol_func) #initialize results struct
     prim, res #return deliverables
 end
@@ -36,30 +38,70 @@ end
 #Bellman Operator
 function Bellman(prim::Primitives,res::Results)
     @unpack val_func = res #unpack value function
-    @unpack k_grid, β, δ, α, nk = prim #unpack model primitives
-    v_next = zeros(nk) #next guess of value function to fill
-
+    @unpack k_grid, β, δ, α, nk,nz,z_shocks, matrix, = prim #unpack model primitives
+    v_next = zeros(nk,nz) #next guess of value function to fill
     choice_lower = 1 #for exploiting monotonicity of policy function
-    for k_index = 1:nk
-        k = k_grid[k_index] #value of k
-        candidate_max = -Inf #bad candidate max
-        budget = k^α + (1-δ)*k #budget
+    
+    for z_index in 1:nz
+        prob = matrix[z_index,:] # added prob
+        z = z_shocks[z_index] #added shock
+        for k_index = 1:nk
+            k = k_grid[k_index] #value of k # added z_index
+            candidate_max = -Inf #bad candidate max
+            budget = z*k^α + (1-δ)*k #budget
 
-        for kp_index in choice_lower:nk #loop over possible selections of k', exploiting monotonicity of policy function
-            c = budget - k_grid[kp_index] #consumption given k' selection
-            if c>0 #check for positivity
-                val = log(c) + β*val_func[kp_index] #compute value
-                if val > candidate_max #check for new max value
-                    candidate_max = val #update max value
-                    res.pol_func[k_index] = k_grid[kp_index] #update policy function
-                    choice_lower = kp_index #update lowest possible choice
+            for kp_index in choice_lower:nk #loop over possible selections of k', exploiting monotonicity of policy function
+                c = budget - k_grid[kp_index] #consumption given k' selection
+                if c>0 #check for positivity
+                    val = log(c) + β*val_func[kp_index,:]'*prob #compute value # added *prob and val_func[,:] !
+                    if val>candidate_max #check for new max value
+                        candidate_max = val #update max value
+                        res.pol_func[k_index,z_index] = k_grid[kp_index] #update policy function # added z_index
+                        #choice_lower = kp_index #update lowest possible choice # not true in this instance
+                    end
                 end
             end
+
+            v_next[k_index, z_index] = candidate_max #update value function
         end
-        v_next[k_index] = candidate_max #update value function
+
     end
-    v_next #return next guess of value function
+    return v_next #return next guess of value function
 end
+
+@everywhere function Bellman_parall(prim::Primitives,res::Results)
+    @unpack val_func = res #unpack value function
+    @unpack k_grid, β, δ, α, nk,nz,z_shocks, matrix, = prim #unpack model primitives
+    v_next = SharedArray{Float64}(nk,nz) #next guess of value function to fill
+    choice_lower = 1 #for exploiting monotonicity of policy function
+    
+    for z_index in 1:nz
+        prob = matrix[z_index,:] # added prob
+        z = z_shocks[z_index] #added shock
+        @sync @distributed for k_index = 1:nk
+            k = k_grid[k_index] #value of k # added z_index
+            candidate_max = -Inf #bad candidate max
+            budget = z*k^α + (1-δ)*k #budget
+
+            for kp_index in choice_lower:nk #loop over possible selections of k', exploiting monotonicity of policy function
+                c = budget - k_grid[kp_index] #consumption given k' selection
+                if c>0 #check for positivity
+                    val = log(c) + β*val_func[kp_index,:]'*prob #compute value # added *prob and val_func[,:] !
+                    if val>candidate_max #check for new max value
+                        candidate_max = val #update max value
+                        res.pol_func[k_index,z_index] = k_grid[kp_index] #update policy function # added z_index
+                        #choice_lower = kp_index #update lowest possible choice # not true in this instance
+                    end
+                end
+            end
+
+            v_next[k_index, z_index] = candidate_max #update value function
+        end
+
+    end
+    return v_next #return next guess of value function
+end
+
 
 #Value function iteration
 function V_iterate(prim::Primitives, res::Results; tol::Float64 = 1e-4, err::Float64 = 100.0)
@@ -77,5 +119,59 @@ end
 #solve the model
 function Solve_model(prim::Primitives, res::Results)
     V_iterate(prim, res) #in this case, all we have to do is the value function iteration!
+end
+
+
+using Distributed, SharedArrays
+
+function Bellman_parall(prim::Primitives,res::Results)
+    @unpack val_func = res #unpack value function
+    @unpack k_grid, β, δ, α, nk,nz,z_shocks, matrix, = prim #unpack model primitives
+    v_next = SharedArray{Float64}(nk,nz) #next guess of value function to fill
+    choice_lower = 1 #for exploiting monotonicity of policy function
+    
+    for z_index in 1:nz
+        prob = matrix[z_index,:] # added prob
+        z = z_shocks[z_index] #added shock
+        for k_index = 1:nk
+            k = k_grid[k_index] #value of k # added z_index
+            candidate_max = -Inf #bad candidate max
+            budget = z*k^α + (1-δ)*k #budget
+
+            @sync @distributed for kp_index in choice_lower:nk #loop over possible selections of k', exploiting monotonicity of policy function
+                c = budget - k_grid[kp_index] #consumption given k' selection
+                if c>0 #check for positivity
+                    val = log(c) + β*val_func[kp_index,:]'*prob #compute value # added *prob and val_func[,:] !
+                    if val>candidate_max #check for new max value
+                        candidate_max = val #update max value
+                        res.pol_func[k_index,z_index] = k_grid[kp_index] #update policy function # added z_index
+                        #choice_lower = kp_index #update lowest possible choice # not true in this instance
+                    end
+                end
+            end
+
+            v_next[k_index, z_index] = candidate_max #update value function
+        end
+
+    end
+    return v_next #return next guess of value function
+end
+
+#Value function iteration
+function V_iterate_parall(prim::Primitives, res::Results; tol::Float64 = 1e-4, err::Float64 = 100.0)
+    n = 0 #counter
+
+    while err>tol #begin iteration
+        v_next = Bellman_parall(prim, res) #spit out new vectors
+        err = abs.(maximum(v_next.-res.val_func))/abs(v_next[prim.nk, 1]) #reset error level
+        res.val_func = v_next #update value function
+        n+=1
+    end
+    println("Value function converged in ", n, " iterations.")
+end
+
+#solve the model
+function Solve_model_parall(prim::Primitives, res::Results)
+    V_iterate_parall(prim, res) #in this case, all we have to do is the value function iteration!
 end
 ##############################################################################
