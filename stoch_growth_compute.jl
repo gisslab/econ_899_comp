@@ -3,10 +3,10 @@ using Distributed
 using SharedArrays
 
 include("stoch_growth_model.jl") #import the functions that solve our growth model
-
+include("stoch_growth_model_parall.jl") 
 
 prim, res = Initialize() #initialize primitive and results structs
-@elapsed Solve_model(prim, res) #solve the model!
+@time @elapsed Solve_model(prim, res) #solve the model!
 @unpack val_func, pol_func = res
 @unpack k_grid = prim
 

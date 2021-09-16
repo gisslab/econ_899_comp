@@ -2,7 +2,6 @@ using Parameters
 using Distributed
 using SharedArrays
 
-
 @with_kw struct Primitives
     β::Float64 = 0.99 #discount rate
     δ::Float64 = 0.025 #depreciation rate
@@ -28,7 +27,7 @@ end
 
 
 #function for initializing model primitives and results
-function Initialize()
+@everywhere function Initialize()
     prim = Primitives() #initialize primtiives
     val_func = zeros(prim.nk, prim.nz) #initial value function guess
     pol_func = zeros(prim.nk,prim.nz) #initial policy function guess
@@ -36,17 +35,17 @@ function Initialize()
     prim, res #return deliverables
 end
 
-#Bellman Operator
-function Bellman(prim::Primitives,res::Results)
+
+@everywhere function Bellman_parall(prim::Primitives,res::Results)
     @unpack val_func = res #unpack value function
     @unpack k_grid, β, δ, α, nk,nz,z_shocks, matrix, = prim #unpack model primitives
-    v_next = zeros(nk,nz) #next guess of value function to fill
+    v_next = SharedArray{Float64}(nk,nz) #next guess of value function to fill
     choice_lower = 1 #for exploiting monotonicity of policy function
     
     for z_index in 1:nz
         prob = matrix[z_index,:] # added prob
         z = z_shocks[z_index] #added shock
-        for k_index = 1:nk
+        @sync @distributed for k_index = 1:nk
             k = k_grid[k_index] #value of k # added z_index
             candidate_max = -Inf #bad candidate max
             budget = z*k^α + (1-δ)*k #budget
@@ -72,11 +71,11 @@ end
 
 
 #Value function iteration
-function V_iterate(prim::Primitives, res::Results; tol::Float64 = 1e-4, err::Float64 = 100.0)
+function V_iterate_parall(prim::Primitives, res::Results; tol::Float64 = 1e-4, err::Float64 = 100.0)
     n = 0 #counter
 
     while err>tol #begin iteration
-        v_next = Bellman(prim, res) #spit out new vectors
+        v_next = Bellman_parall(prim, res) #spit out new vectors
         err = abs.(maximum(v_next.-res.val_func))/abs(v_next[prim.nk, 1]) #reset error level
         res.val_func = v_next #update value function
         n+=1
@@ -85,12 +84,7 @@ function V_iterate(prim::Primitives, res::Results; tol::Float64 = 1e-4, err::Flo
 end
 
 #solve the model
-function Solve_model(prim::Primitives, res::Results)
-    V_iterate(prim, res) #in this case, all we have to do is the value function iteration!
+function Solve_model_parall(prim::Primitives, res::Results)
+    V_iterate_parall(prim, res) #in this case, all we have to do is the value function iteration!
 end
-
-
-using Distributed, SharedArrays
-
-
 ##############################################################################
